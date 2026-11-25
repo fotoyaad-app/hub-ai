@@ -30,6 +30,7 @@ jobs:
       shards: ${{ steps.p.outputs.shards }}
       of: ${{ steps.p.outputs.of }}
       minutes: ${{ steps.p.outputs.minutes }}
+      jobkey: ${{ steps.p.outputs.jobkey }}
     steps:
       - id: p
         shell: bash
@@ -51,7 +52,7 @@ jobs:
           for j in p['jobs']: print('%-8s %5.1f%%  %d left' % (j['job'], j['pct'], j['left']))
           print('minutes left this month: %d, shards %d, minutes %d, go %s' % (left, shards, mins, go))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('go=%s\njobs=%s\nshards=%s\nof=%d\nminutes=%d\n' % ('true' if go else 'false', ','.join(jobs), json.dumps(list(range(shards))), shards, mins))
+              f.write('go=%s\njobs=%s\njobkey=%s\nshards=%s\nof=%d\nminutes=%d\n' % ('true' if go else 'false', ','.join(jobs), '-'.join(sorted(jobs)) or 'none', json.dumps(list(range(shards))), shards, mins))
           PY
         env:
           IN_JOBS: ${{ inputs.jobs }}
@@ -80,8 +81,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../hf
-          key: hf-v1-${{ needs.plan.outputs.jobs }}
-          restore-keys: hf-v1-
+          key: hf-v2-${{ needs.plan.outputs.jobkey }}-${{ hashFiles('hubai/jobs.py') }}
+          restore-keys: hf-v2-${{ needs.plan.outputs.jobkey }}-
       - name: Install
         run: |
           python -m pip install -q -r requirements.txt

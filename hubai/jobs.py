@@ -157,13 +157,14 @@ class Tags:
 # ---------------- music: CLAP (larger_clap_music) moods, tags and a sound embedding ----------------
 class Music:
     kind = 'music'; batch = 4; workers = 4
-    MODEL = os.environ.get('MUSIC_MODEL', 'laion/larger_clap_music')
+    MODEL = os.environ.get('MUSIC_MODEL', 'laion/larger_clap_music_and_speech')
     MAX_BYTES = 30 * 1024 * 1024
 
     def load(self):
         torch = _torch()
         from transformers import ClapModel, ClapProcessor
-        from .labels import MUSIC_MOODS, MUSIC_TAG_GROUPS
+        from .labels import MUSIC_MOODS, MUSIC_TAG_GROUPS, MOOD_CAL
+        self.cal = MOOD_CAL
         self.model = ClapModel.from_pretrained(self.MODEL).eval()
         self.proc = ClapProcessor.from_pretrained(self.MODEL)
         self.moods = MUSIC_MOODS; self.groups = MUSIC_TAG_GROUPS
@@ -206,8 +207,9 @@ class Music:
                     e = f.mean(0); e = e / e.norm()
                 moods = {}
                 for k, (pa, pb) in self.moods.items():
-                    s = T.stack([e @ self.tx[pa], e @ self.tx[pb]]) * self.scale
-                    moods[k] = round(float(T.softmax(s, 0)[0]), 3)
+                    mu, sd = self.cal.get(k, (0.0, 0.15))
+                    z = (float(e @ self.tx[pa] - e @ self.tx[pb]) - mu) / (sd or 0.15)
+                    moods[k] = round(1 / (1 + math.exp(-2 * (z - 0.9))), 3)
                 tags = []
                 for g, ls in self.groups.items():
                     s = T.stack([e @ self.tx[l] for l in ls]) * self.scale

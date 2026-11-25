@@ -25,9 +25,9 @@ MUSIC_MOODS = {
  'focus': ('instrumental background music without singing, for studying', 'a song with lead vocals and lyrics'),
  'sleep': ('very slow, gentle lullaby for falling asleep', 'fast, upbeat and loud music'),
 }
+# Mean / std of (cos(pos) - cos(neg)) over 180 random songs of the library (25 Nov 2026, larger_clap_music_and_speech).
+# Stored score = sigmoid(2 * (z - 0.9)): 0.5 = top ~18%, 0.55 = top ~16% (the Hub's boost starts there), 0.9 = clearly that mood.
+MOOD_CAL = {"calm": [-0.0116, 0.1455], "party": [0.0722, 0.1442], "devotional": [-0.181, 0.2116], "sad": [-0.0864, 0.1115], "romantic": [0.1001, 0.1803], "focus": [-0.3105, 0.1876], "sleep": [-0.0558, 0.1348]}
 MUSIC_TAG_GROUPS = {
  'genre': ['carnatic classical music', 'hindustani classical music', 'indian folk music', 'indian film song', 'devotional music', 'hip hop', 'rap', 'electronic dance music', 'rock', 'pop', 'jazz', 'lo-fi', 'ghazal', 'qawwali', 'western classical music'],
- 'vocals': ['male vocals', 'female vocals', 'male and female duet', 'chorus singing', 'no vocals, instrumental'],
- 'instrument': ['flute', 'veena', 'sitar', 'piano', 'acoustic guitar', 'electric guitar', 'violin', 'tabla', 'drums', 'synthesizer', 'nadaswaram', 'mridangam'],
- 'tempo': ['slow tempo', 'medium tempo', 'fast tempo'],
 }
