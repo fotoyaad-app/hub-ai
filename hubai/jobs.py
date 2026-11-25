@@ -6,6 +6,11 @@ from PIL import Image
 THREADS = int(os.environ.get('TORCH_THREADS', '0')) or os.cpu_count() or 2
 
 
+def rss_mb():
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+
 def _torch():
     import torch
     torch.set_num_threads(THREADS)
@@ -67,7 +72,7 @@ class SigBlur:
 
 # ---------------- caption: Florence-2 large ----------------
 class Caption:
-    kind = 'p'; batch = 8; workers = 8
+    kind = 'p'; batch = int(os.environ.get('CAPTION_BATCH', '2')); workers = 8
     MODEL = os.environ.get('CAPTION_MODEL', 'microsoft/Florence-2-large')
     TASK = '<DETAILED_CAPTION>'
 
@@ -84,7 +89,7 @@ class Caption:
             self.model = AutoModelForCausalLM.from_pretrained(self.MODEL, trust_remote_code=True, torch_dtype=torch.float32, attn_implementation='eager', low_cpu_mem_usage=True).eval()
             self.proc = AutoProcessor.from_pretrained(self.MODEL, trust_remote_code=True)
         if os.environ.get('QUANT', '1') == '1':
-            self.model = torch.quantization.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
+            torch.quantization.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)  # inplace: no second fp32 copy (7 GB runners)
         self.torch = torch
 
     @staticmethod

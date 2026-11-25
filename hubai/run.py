@@ -2,7 +2,7 @@
 Prints only counts and speeds (safe for public logs)."""
 import argparse, gc, os, sys, time, concurrent.futures as cf
 from . import hub
-from .jobs import JOBS
+from .jobs import JOBS, rss_mb
 
 T0 = float(os.environ.get('JOB_T0') or time.time())
 
@@ -28,7 +28,7 @@ def run_job(name, a, deadline):
     first = hub.get_json('/bgai/gh/todo', job=name, n=1, shard=a.shard, of=a.of, after=0)
     if not first:
         log(name, 'nothing to do'); hub.post_json('/bgai/gh/progress', {'job': name, 'shard': a.shard, 'run': a.run, 'state': 'done', 'n': 0, 'final': True}); return 0
-    log(name, 'loading model'); J.load(); log(name, 'model ready in %.0fs' % (time.time() - t_load))
+    log(name, 'loading model'); J.load(); log(name, 'model ready in %.0fs, peak memory %d MB' % (time.time() - t_load, rss_mb()))
     after, n, fail, skipped, t0, last_p, limit = 0, 0, 0, 0, time.time(), time.time() - 240, a.limit or 10 ** 9
     state = 'running'
     pool = cf.ThreadPoolExecutor(J.workers)
@@ -54,7 +54,7 @@ def run_job(name, a, deadline):
             if time.time() - last_p > 300:
                 rate = n / max(1e-6, (time.time() - t0) / 60)
                 hub.post_json('/bgai/gh/progress', {'job': name, 'shard': a.shard, 'run': a.run, 'state': 'running', 'n': n, 'fail': fail, 'sec': time.time() - t0, 'rate': rate})
-                log(name, 'done %d, failed %d, skipped %d, %.1f/min' % (n, fail, skipped, rate)); last_p = time.time()
+                log(name, 'done %d, failed %d, skipped %d, %.1f/min, peak memory %d MB' % (n, fail, skipped, rate, rss_mb())); last_p = time.time()
             if time.time() > deadline:
                 break
     pool.shutdown(wait=False)
