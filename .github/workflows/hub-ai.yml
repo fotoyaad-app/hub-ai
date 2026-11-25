@@ -1,15 +1,16 @@
 name: Hub AI (background)
-# Heavy AI for the Hub on GitHub's computers: captions, smart tags, song moods, 100%-similar + blur.
-# Reads media through the Hub's key-checked endpoints, posts only results back. Logs print counts only.
+# Heavy AI for the Hub on GitHub's standard runners: photo captions + tags, video keyframes, song moods, document text, similar/blur.
+# Media is read through the Hub's key-checked endpoints and only results are posted back.
+# Public logs: counts and percentages only. HUB_URL / HUB_AI_KEY come only from repository secrets and are masked.
 on:
   schedule:
-    - cron: '17 */6 * * *'   # safety net; while there is work, each run starts the next one (chain)
+    - cron: '17 */6 * * *'   # incremental: new photos/videos/songs/files every 6 h; while a backlog is left each run starts the next (chain)
   workflow_dispatch:
     inputs:
       jobs: { description: 'Jobs (comma list) or auto', default: 'auto' }
-      minutes: { description: 'Minutes of work per shard', default: '50' }
-      shards: { description: 'Parallel shards (0 = Hub setting)', default: '0' }
-      limit: { description: 'Max items per job per shard (0 = no limit, for tests)', default: '0' }
+      minutes: { description: 'Minutes of work per shard', default: '100' }
+      shards: { description: 'Parallel shards, max 4 (0 = Hub setting)', default: '0' }
+      limit: { description: 'Max items per job per shard (0 = no limit; >0 = test, runs even when paused in the Hub)', default: '0' }
       chain: { description: 'Start the next run when work is left (yes/no)', default: 'yes' }
 permissions:
   contents: read
@@ -32,60 +33,80 @@ jobs:
       minutes: ${{ steps.p.outputs.minutes }}
       jobkey: ${{ steps.p.outputs.jobkey }}
     steps:
+      - name: Mask
+        shell: bash
+        run: |
+          h="${HUB_URL#*://}"; h="${h%%/*}"; [ -n "$h" ] && echo "::add-mask::$h" && echo "::add-mask::${h%%.*}"
+          [ -n "$HUB_URL" ] && [ -n "$HUB_AI_KEY" ] || { echo "secrets missing"; exit 1; }
       - id: p
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsS --retry 3 -H "x-hub-ai-key: $HUB_AI_KEY" "$HUB_URL/bgai/gh/plan" -o plan.json
+          curl -fsS --retry 3 -H "x-hub-ai-key: $HUB_AI_KEY" "$HUB_URL/bgai/gh/plan" -o plan.json 2>/dev/null || { echo "hub not reachable"; exit 1; }
           python3 - <<'PY'
           import json, os
           p = json.load(open('plan.json')); i = lambda k, d: (os.environ.get('IN_' + k) or d)
-          want = i('JOBS', 'auto'); order = ['sigblur', 'music', 'caption', 'tags']
-          jobs = [j['job'] for j in sorted(p['jobs'], key=lambda j: order.index(j['job']) if j['job'] in order else 9) if j['enabled'] and j['left'] > 0]
-          if want != 'auto': jobs = [j for j in want.split(',') if j in order]
-          shards = int(i('SHARDS', '0') or 0) or int(p['cfg'].get('shards', 1))
-          mins = float(i('MINUTES', '50'))
+          want = i('JOBS', 'auto'); order = ['sigblur', 'tags', 'music', 'docs', 'video', 'caption']  # fast jobs first, captions (slowest) last
+          known = [j for j in p['jobs'] if j['job'] in order]
+          jobs = [j['job'] for j in sorted(known, key=lambda j: order.index(j['job'])) if j['enabled'] and j['left'] > 0]
+          if want != 'auto': jobs = [j for j in order if j in want.split(',')]
+          shards = min(4, int(i('SHARDS', '0') or 0) or int(p['cfg'].get('shards', 1)))
+          mins = min(150.0, float(i('MINUTES', '100')))
           left = float(p.get('minutesLeft', 0))
-          if want == 'auto' and left < shards * (mins + 6):  # keep inside the monthly budget set in the Hub
-              shards = max(1, int(left // (mins + 6))); mins = min(mins, max(5.0, left - 6))
-          go = bool(jobs) and p.get('go') and left > 10
-          for j in p['jobs']: print('%-8s %5.1f%%  %d left' % (j['job'], j['pct'], j['left']))
-          print('minutes left this month: %d, shards %d, minutes %d, go %s' % (left, shards, mins, go))
+          if left < shards * (mins + 8):  # keep inside the monthly budget set in the Hub
+              shards = max(1, min(shards, int(left // (mins + 8)))); mins = min(mins, max(5.0, left - 8))
+          test = int(i('LIMIT', '0') or 0) > 0
+          go = bool(jobs) and (p.get('go') or test) and left > 10
+          for j in known: print('%-8s %5.1f%%  %d left' % (j['job'], j['pct'], j['left']))
+          print('shards %d, minutes %d, go %s' % (shards, mins, go))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write('go=%s\njobs=%s\njobkey=%s\nshards=%s\nof=%d\nminutes=%d\n' % ('true' if go else 'false', ','.join(jobs), '-'.join(sorted(jobs)) or 'none', json.dumps(list(range(shards))), shards, mins))
           PY
+          rm -f plan.json
         env:
           IN_JOBS: ${{ inputs.jobs }}
           IN_SHARDS: ${{ inputs.shards }}
           IN_MINUTES: ${{ inputs.minutes }}
+          IN_LIMIT: ${{ inputs.limit }}
   work:
     needs: plan
     if: needs.plan.outputs.go == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
       HF_HOME: ${{ github.workspace }}/../hf
       HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
       TRANSFORMERS_VERBOSITY: error
+      TRANSFORMERS_NO_ADVISORY_WARNINGS: '1'
       TOKENIZERS_PARALLELISM: 'false'
+      PYTHONWARNINGS: ignore
     steps:
-      - run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Mask
+        shell: bash
+        run: |
+          echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+          h="${HUB_URL#*://}"; h="${h%%/*}"; [ -n "$h" ] && echo "::add-mask::$h" && echo "::add-mask::${h%%.*}"
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: actions/setup-python@v5
         with: { python-version: '3.11', cache: pip }
       - name: Model cache
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../hf
-          key: hf-v2-${{ needs.plan.outputs.jobkey }}-${{ hashFiles('hubai/jobs.py') }}
-          restore-keys: hf-v2-${{ needs.plan.outputs.jobkey }}-
+          key: hf-v3-${{ needs.plan.outputs.jobkey }}-${{ hashFiles('hubai/jobs.py', 'requirements.txt') }}
+          restore-keys: |
+            hf-v3-${{ needs.plan.outputs.jobkey }}-
+            hf-v3-
       - name: Install
         run: |
-          python -m pip install -q -r requirements.txt
+          python -m pip install -q --disable-pip-version-check -r requirements.txt
           command -v ffmpeg >/dev/null || (sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg >/dev/null)
       - name: Run
         run: python -m hubai.run --jobs "${{ needs.plan.outputs.jobs }}" --shard ${{ matrix.shard }} --of ${{ needs.plan.outputs.of }} --minutes ${{ needs.plan.outputs.minutes }} --limit "${{ inputs.limit || 0 }}"
@@ -100,7 +121,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fsS --retry 3 -H "x-hub-ai-key: $HUB_AI_KEY" "$HUB_URL/bgai/gh/plan" -o plan.json
-          next=$(python3 -c "import json;p=json.load(open('plan.json'));print('yes' if p.get('go') and p.get('minutesLeft',0)>20 and any(j['enabled'] and j['left']>0 for j in p['jobs']) else 'no')")
+          h="${HUB_URL#*://}"; h="${h%%/*}"; [ -n "$h" ] && echo "::add-mask::$h" && echo "::add-mask::${h%%.*}"
+          curl -fsS --retry 3 -H "x-hub-ai-key: $HUB_AI_KEY" "$HUB_URL/bgai/gh/plan" -o plan.json 2>/dev/null || { echo "hub not reachable"; exit 0; }
+          next=$(python3 -c "
+          import json; p = json.load(open('plan.json'))
+          for j in p['jobs']: print('%-8s %5.1f%%  %d left' % (j['job'], j['pct'], j['left']), flush=True)
+          print('NEXT=' + ('yes' if p.get('go') and p.get('cfg', {}).get('chain', True) and p.get('minutesLeft', 0) > 20 and any(j['enabled'] and j['left'] > 0 for j in p['jobs']) else 'no'))" | tee /dev/stderr | sed -n 's/^NEXT=//p')
+          rm -f plan.json
           echo "next run: $next"
-          if [ "$next" = yes ]; then gh workflow run hub-ai.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"; fi
+          if [ "$next" = yes ]; then sleep 30; gh workflow run hub-ai.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"; fi

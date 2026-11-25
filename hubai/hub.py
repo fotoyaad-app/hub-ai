@@ -1,10 +1,18 @@
 """Talks to the Hub Worker. Only counts are ever printed: no keys, file names or paths (the repo may become public)."""
-import os, time, json
+import os, sys, time, json, logging, warnings
 import requests
+from requests.adapters import HTTPAdapter
+
+# Public logs: library loggers/warnings can print hosts or URLs, so they are silenced; uncaught errors print only their type.
+logging.getLogger('urllib3').setLevel(logging.CRITICAL)
+logging.getLogger('requests').setLevel(logging.CRITICAL)
+warnings.filterwarnings('ignore')
+sys.excepthook = lambda t, v, tb: print('error', t.__name__, file=sys.stderr, flush=True)
 
 BASE = os.environ.get('HUB_URL', '').rstrip('/')
 KEY = os.environ.get('HUB_AI_KEY', '')
 S = requests.Session()
+S.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=32))
 S.headers.update({'x-hub-ai-key': KEY, 'user-agent': 'hub-ai-runner/1'})
 
 
@@ -38,9 +46,11 @@ def post_json(path, body):
     return r.json()
 
 
-def blob(key, max_bytes=None):
+def blob(key=None, max_bytes=None, job=None, id=None):
+    """Media bytes from R2 via the Hub. Newer Hubs serve by job + id, so the runner never sees file names or paths."""
     h = {'range': 'bytes=0-%d' % (max_bytes - 1)} if max_bytes else {}
-    r = _call('GET', '/bgai/gh/blob', params={'k': key}, headers=h, timeout=180)
+    params = {'k': key} if key else {'job': job, 'id': id}
+    r = _call('GET', '/bgai/gh/blob', params=params, headers=h, timeout=300)
     if r.status_code not in (200, 206):
         return None
     return r.content

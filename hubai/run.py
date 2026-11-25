@@ -11,14 +11,21 @@ def log(*a):
     print(time.strftime('%H:%M:%S'), *a, flush=True)
 
 
-def fetch(it, kind):
-    if not it.get('k'):
+CAP = {'music': 30 * 1024 * 1024, 'video': 150 * 1024 * 1024, 'doc': 40 * 1024 * 1024}
+
+
+def fetch(it, kind, job):
+    """Download one item. Items carry an opaque R2 key ('k') or, on newer Hubs, only an id (the Hub resolves it)."""
+    if not it.get('k') and not it.get('blob'):
         return None
+    size, cap = it.get('size') or 0, CAP.get(kind)
+    if kind in ('video', 'doc') and cap and size > cap:
+        return None  # too big for a runner; marked as skipped, never logged by name
     try:
-        if kind == 'music':
-            mb = 30 * 1024 * 1024
-            return hub.blob(it['k'], mb if (it.get('size') or 0) > mb else None)
-        return hub.blob(it['k'])
+        rng = cap if kind == 'music' and size > cap else None
+        if it.get('k'):
+            return hub.blob(it['k'], rng)
+        return hub.blob(None, rng, job=job, id=it['id'])
     except Exception:
         return None
 
@@ -41,10 +48,10 @@ def run_job(name, a, deadline):
         if not items:
             state = 'done'; break
         after = items[-1]['id']
-        blobs = list(pool.map(lambda it: fetch(it, J.kind), items))
+        blobs = list(pool.map(lambda it: fetch(it, J.kind, name), items))
         for i in range(0, len(items), J.batch):
             its, bs = items[i:i + J.batch], blobs[i:i + J.batch]
-            keep = [(it, b) for it, b in zip(its, bs) if b is not None or J.kind == 'music' and not it.get('k')]
+            keep = [(it, b) for it, b in zip(its, bs) if b is not None]  # no R2 copy yet / download failed: not marked, retried once the file is in R2
             skipped += len(its) - len(keep)  # download failed: retried next run (not marked)
             if not keep:
                 continue
@@ -69,7 +76,7 @@ def run_job(name, a, deadline):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--jobs', default='sigblur,music,caption,tags'); p.add_argument('--shard', type=int, default=0); p.add_argument('--of', type=int, default=1)
+    p.add_argument('--jobs', default='sigblur,tags,music,docs,video,caption'); p.add_argument('--shard', type=int, default=0); p.add_argument('--of', type=int, default=1)
     p.add_argument('--minutes', type=float, default=50); p.add_argument('--limit', type=int, default=0); p.add_argument('--run', default=os.environ.get('GITHUB_RUN_ID', 'local')); p.add_argument('--child', action='store_true')
     a = p.parse_args()
     if not hub.BASE or not hub.KEY:

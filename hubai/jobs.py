@@ -1,4 +1,4 @@
-"""The four Hub AI jobs. Each job: load() once, then run(items, blobs) -> list of result dicts (id + fields, or id + err)."""
+"""The Hub AI jobs (photos, videos, music, documents). Never logs names or paths. Each job: load() once, then run(items, blobs) -> list of result dicts (id + fields, or id + err)."""
 import io, os, math, base64, subprocess, tempfile
 import numpy as np
 from PIL import Image
@@ -103,9 +103,11 @@ class Caption:
             t = t[:cut + 1] if cut > 40 else t[:300]
         return t
 
-    def run(self, items, blobs):
+    def run(self, items, blobs, images=None):
         out, ims, ok = [], [], []
-        for it, b in zip(items, blobs):
+        if images is not None:
+            ims, ok = list(images), list(items)
+        for it, b in ([] if images is not None else zip(items, blobs)):
             try:
                 ims.append(open_img(b).convert('RGB')); ok.append(it)
             except Exception as e:
@@ -232,4 +234,128 @@ class Music:
         return out
 
 
-JOBS = {'sigblur': SigBlur, 'caption': Caption, 'tags': Tags, 'music': Music}
+# ---------------- video: 3 keyframes per video -> SigLIP tags (max over frames) + Florence caption (middle frame) ----------------
+def _frames(b, n=3, width=768):
+    """Keyframes at 20/50/80% of the clip. Works on the Hub's 720p preview (or any video bytes). No names or paths are involved."""
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'v')
+        with open(src, 'wb') as f:
+            f.write(b)
+        r = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', src], capture_output=True, timeout=60)
+        try:
+            dur = float(r.stdout.decode().strip() or 0)
+        except ValueError:
+            dur = 0
+        pts = [dur * c for c in ((0.2, 0.5, 0.8) if n == 3 else (0.5,))] if dur > 1 else [0]
+        out = []
+        for i, t in enumerate(pts):
+            p = os.path.join(d, '%d.jpg' % i)
+            subprocess.run(['ffmpeg', '-v', 'quiet', '-nostdin', '-ss', '%.2f' % t, '-i', src, '-frames:v', '1', '-vf', 'scale=%d:-2' % width, '-q:v', '3', '-y', p], capture_output=True, timeout=120)
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                with open(p, 'rb') as f:
+                    out.append(open_img(f.read()).convert('RGB'))
+        return out
+
+
+class Video:
+    kind = 'video'; batch = 2; workers = 3
+    MAX_BYTES = 150 * 1024 * 1024
+
+    def load(self):
+        self.tags = Tags(); self.tags.load()
+        self.cap = Caption(); self.cap.load()
+
+    def run(self, items, blobs):
+        out = []
+        for it, b in zip(items, blobs):
+            try:
+                fr = _frames(b)
+                if not fr:
+                    out.append({'id': it['id'], 'err': 'no frames'}); continue
+                T = self.tags.torch
+                with T.inference_mode():
+                    f = self.tags.model.get_image_features(**self.tags.proc(images=fr, return_tensors='pt'))
+                    f = f / f.norm(dim=-1, keepdim=True)
+                    p = T.sigmoid(f @ self.tags.txt.T * self.tags.model.logit_scale.exp() + self.tags.model.logit_bias).numpy().max(0)
+                idx = np.argsort(-p)[:8]
+                tags = [[self.tags.labels[i], round(float(p[i]), 3)] for i in idx if p[i] >= self.tags.MIN_P]
+                c = self.cap.run([{'id': it['id']}], [None], images=[fr[len(fr) // 2]])
+                r = {'id': it['id'], 'tags': tags}
+                if c and c[0].get('text'):
+                    r['text'] = c[0]['text']
+                out.append(r)
+            except Exception as e:
+                out.append({'id': it['id'], 'err': 'video ' + type(e).__name__})
+        return out
+
+
+# ---------------- docs: text from PDF / Word / text files (scanned PDFs: Florence OCR of the first pages) ----------------
+class Docs:
+    kind = 'doc'; batch = 4; workers = 6
+    MAX_BYTES = 40 * 1024 * 1024
+    MAX_CHARS = 20000
+    TEXT_EXT = {'txt', 'md', 'csv', 'tsv', 'json', 'xml', 'log', 'ini', 'yaml', 'yml', 'srt', 'vtt'}
+    HTML_EXT = {'html', 'htm'}
+
+    def load(self):
+        self.ocr = None  # Florence is loaded only if a scanned PDF needs it
+
+    @staticmethod
+    def _clean(t):
+        return ' '.join(str(t).replace('\x00', ' ').split())
+
+    def _ocr_pdf(self, b, pages=2):
+        import pypdfium2 as pdfium
+        if self.ocr is None:
+            self.ocr = Caption(); self.ocr.load()
+        pdf = pdfium.PdfDocument(b); txt = []
+        for i in range(min(pages, len(pdf))):
+            im = pdf[i].render(scale=1.5).to_pil().convert('RGB')
+            T = self.ocr.torch
+            with T.inference_mode():
+                x = self.ocr.proc(text=['<OCR>'], images=[im], return_tensors='pt')
+                ids = self.ocr.model.generate(input_ids=x['input_ids'], pixel_values=x['pixel_values'], max_new_tokens=512, num_beams=1, do_sample=False)
+                txt.append(self.ocr.proc.batch_decode(ids, skip_special_tokens=True)[0])
+        return ' '.join(txt)
+
+    def text(self, b, ext):
+        """-> (text, source) with the Hub's ocr_text source names: pdf, pdf-ocr, office, text."""
+        ext = (ext or '').lower()
+        if ext == 'pdf':
+            from pypdf import PdfReader
+            r = PdfReader(io.BytesIO(b)); t = []
+            for pg in r.pages[:60]:
+                try:
+                    t.append(pg.extract_text() or '')
+                except Exception:
+                    pass
+                if sum(map(len, t)) > self.MAX_CHARS:
+                    break
+            t = self._clean(' '.join(t))
+            return (t, 'pdf') if len(t) >= 30 else (self._clean(self._ocr_pdf(b)), 'pdf-ocr')
+        if ext == 'docx':
+            import docx
+            d = docx.Document(io.BytesIO(b))
+            parts = [p.text for p in d.paragraphs] + [c.text for tb in d.tables for row in tb.rows for c in row.cells]
+            return self._clean(' '.join(parts)), 'office'
+        if ext in self.TEXT_EXT or ext in self.HTML_EXT:
+            s = b[:2 * 1024 * 1024].decode('utf-8', 'replace')
+            if ext in self.HTML_EXT:
+                import re, html
+                s = html.unescape(re.sub(r'(?s)<(script|style).*?</\1>|<[^>]+>', ' ', s))
+            return self._clean(s), 'text'
+        return '', 'text'
+
+    def run(self, items, blobs):
+        out = []
+        for it, b in zip(items, blobs):
+            try:
+                t, src = self.text(b, it.get('ext'))
+                t = t[:self.MAX_CHARS]
+                out.append({'id': it['id'], 'text': t, 'src': src} if len(t) >= 3 else {'id': it['id'], 'err': 'no text'})
+            except Exception as e:
+                out.append({'id': it['id'], 'err': 'doc ' + type(e).__name__})
+        return out
+
+
+JOBS = {'sigblur': SigBlur, 'caption': Caption, 'tags': Tags, 'music': Music, 'video': Video, 'docs': Docs}
