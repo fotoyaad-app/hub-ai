@@ -29,7 +29,7 @@ def run_job(name, a, deadline):
     if not first:
         log(name, 'nothing to do'); hub.post_json('/bgai/gh/progress', {'job': name, 'shard': a.shard, 'run': a.run, 'state': 'done', 'n': 0, 'final': True}); return 0
     log(name, 'loading model'); J.load(); log(name, 'model ready in %.0fs' % (time.time() - t_load))
-    after, n, fail, skipped, t0, last_p, limit = 0, 0, 0, 0, time.time(), time.time(), a.limit or 10 ** 9
+    after, n, fail, skipped, t0, last_p, limit = 0, 0, 0, 0, time.time(), time.time() - 240, a.limit or 10 ** 9
     state = 'running'
     pool = cf.ThreadPoolExecutor(J.workers)
     while True:
@@ -70,13 +70,28 @@ def run_job(name, a, deadline):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--jobs', default='sigblur,music,caption,tags'); p.add_argument('--shard', type=int, default=0); p.add_argument('--of', type=int, default=1)
-    p.add_argument('--minutes', type=float, default=50); p.add_argument('--limit', type=int, default=0); p.add_argument('--run', default=os.environ.get('GITHUB_RUN_ID', 'local'))
+    p.add_argument('--minutes', type=float, default=50); p.add_argument('--limit', type=int, default=0); p.add_argument('--run', default=os.environ.get('GITHUB_RUN_ID', 'local')); p.add_argument('--child', action='store_true')
     a = p.parse_args()
     if not hub.BASE or not hub.KEY:
         log('HUB_URL / HUB_AI_KEY missing'); sys.exit(1)
-    deadline = T0 + a.minutes * 60
-    log('cpus', os.cpu_count(), 'shard %d/%d' % (a.shard, a.of), 'budget %.0f min' % a.minutes)
-    for name in [j for j in a.jobs.split(',') if j in JOBS]:
+    deadline = (time.time() if a.child else T0) + a.minutes * 60
+    if not a.child:
+        log('cpus', os.cpu_count(), 'shard %d/%d' % (a.shard, a.of), 'budget %.0f min' % a.minutes)
+    names = [j for j in a.jobs.split(',') if j in JOBS]
+    if len(names) > 1:  # one process per job: each model's memory is fully freed before the next one loads (2-core runners have 7 GB)
+        import subprocess
+        for name in names:
+            if time.time() > deadline - 120:
+                break
+            r = subprocess.run([sys.executable, '-m', 'hubai.run', '--jobs', name, '--shard', str(a.shard), '--of', str(a.of), '--minutes', str(max(1.0, (deadline - time.time()) / 60)), '--limit', str(a.limit), '--run', a.run, '--child'])
+            if r.returncode:
+                log(name, 'process ended with code', r.returncode)
+                try:
+                    hub.post_json('/bgai/gh/progress', {'job': name, 'shard': a.shard, 'run': a.run, 'state': 'error', 'err': 'exit %d (memory?)' % r.returncode, 'final': True})
+                except Exception:
+                    pass
+        names = []
+    for name in names:
         if time.time() > deadline - 120:
             break
         try:
@@ -87,6 +102,8 @@ def main():
                 hub.post_json('/bgai/gh/progress', {'job': name, 'shard': a.shard, 'run': a.run, 'state': 'error', 'err': type(e).__name__, 'final': True})
             except Exception:
                 pass
+    if a.child:
+        return
     used = (time.time() - T0) / 60
     try:
         hub.post_json('/bgai/gh/progress', {'job': '_min', 'run': a.run, 'minutes': used})
