@@ -7,3 +7,4 @@ einops==0.8.1
 pillow==11.1.0
 numpy==2.2.3
 requests==2.32.3
+accelerate==1.4.0

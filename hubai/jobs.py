@@ -81,7 +81,7 @@ class Caption:
             imp = get_imports(filename)
             return [x for x in imp if x != 'flash_attn']
         with patch('transformers.dynamic_module_utils.get_imports', fixed):
-            self.model = AutoModelForCausalLM.from_pretrained(self.MODEL, trust_remote_code=True, torch_dtype=torch.float32, attn_implementation='eager').eval()
+            self.model = AutoModelForCausalLM.from_pretrained(self.MODEL, trust_remote_code=True, torch_dtype=torch.float32, attn_implementation='eager', low_cpu_mem_usage=True).eval()
             self.proc = AutoProcessor.from_pretrained(self.MODEL, trust_remote_code=True)
         if os.environ.get('QUANT', '1') == '1':
             self.model = torch.quantization.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
@@ -93,7 +93,10 @@ class Caption:
         for p in ('The image shows ', 'The image is ', 'In this image we can see ', 'In this image, ', 'This image shows ', 'The picture shows '):
             if t.startswith(p):
                 t = t[len(p):]; t = t[:1].upper() + t[1:]
-        return t[:300]
+        if len(t) > 300 or not t.endswith('.'):  # keep whole sentences only (generation stops mid-sentence at the token limit)
+            cut = t[:300].rfind('. ')
+            t = t[:cut + 1] if cut > 40 else t[:300]
+        return t
 
     def run(self, items, blobs):
         out, ims, ok = [], [], []
@@ -124,7 +127,7 @@ class Tags:
         torch = _torch()
         from transformers import AutoModel, AutoProcessor
         from .labels import PHOTO_TAGS, PROMPT
-        self.model = AutoModel.from_pretrained(self.MODEL, torch_dtype=torch.float32).eval()
+        self.model = AutoModel.from_pretrained(self.MODEL, torch_dtype=torch.float32, low_cpu_mem_usage=True).eval()
         self.proc = AutoProcessor.from_pretrained(self.MODEL)
         self.labels = PHOTO_TAGS
         with torch.inference_mode():
